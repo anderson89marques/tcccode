@@ -1,0 +1,36 @@
+Traceback (most recent call last):
+  File "/usr/local/bin/pserve", line 9, in <module>
+    load_entry_point('pyramid==1.5.1', 'console_scripts', 'pserve')()
+  File "/usr/local/lib/python3.4/site-packages/pyramid/scripts/pserve.py", line 51, in main
+    return command.run()
+  File "/usr/local/lib/python3.4/site-packages/pyramid/scripts/pserve.py", line 310, in run
+    setup_logging(log_fn)
+  File "/usr/local/lib/python3.4/site-packages/pyramid/paster.py", line 67, in setup_logging
+    parser.read([path])
+  File "/usr/local/lib/python3.4/configparser.py", line 672, in read
+    self._read(fp, filename)
+  File "/usr/local/lib/python3.4/configparser.py", line 1070, in _read
+    fpname, lineno)
+configparser.DuplicateOptionError: While reading from '/home/anderson/PycharmProjects/meutcc/production.ini' [line 15]: option 'pyramid.includes' in section 'app:meutcc' already exists
+Removing PID file pyramid.pid
+Traceback (most recent call last):
+  File "/usr/local/bin/pserve", line 9, in <module>
+    load_entry_point('pyramid==1.5.1', 'console_scripts', 'pserve')()
+  File "/usr/local/lib/python3.4/site-packages/pyramid/scripts/pserve.py", line 51, in main
+    return command.run()
+  File "/usr/local/lib/python3.4/site-packages/pyramid/scripts/pserve.py", line 313, in run
+    relative_to=base, global_conf=vars)
+  File "/usr/local/lib/python3.4/site-packages/pyramid/scripts/pserve.py", line 344, in loadserver
+    server_spec, name=name, relative_to=relative_to, **kw)
+  File "/usr/local/lib/python3.4/site-packages/paste/deploy/loadwsgi.py", line 255, in loadserver
+    return loadobj(SERVER, uri, name=name, **kw)
+  File "/usr/local/lib/python3.4/site-packages/paste/deploy/loadwsgi.py", line 271, in loadobj
+    global_conf=global_conf)
+  File "/usr/local/lib/python3.4/site-packages/paste/deploy/loadwsgi.py", line 296, in loadcontext
+    global_conf=global_conf)
+  File "/usr/local/lib/python3.4/site-packages/paste/deploy/loadwsgi.py", line 317, in _loadconfig
+    loader = ConfigLoader(path)
+  File "/usr/local/lib/python3.4/site-packages/paste/deploy/loadwsgi.py", line 393, in __init__
+    with open(filename) as f:
+FileNotFoundError: [Errno 2] No such file or directory: '/home/anderson/PycharmProjects/meutcc/stop'
+Removing PID file pyramid.pid

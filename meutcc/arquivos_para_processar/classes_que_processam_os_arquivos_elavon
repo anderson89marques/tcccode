@@ -1,0 +1,718 @@
+package com.sysdata.elavon
+
+import java.util.Date;
+
+import com.sysdata.coadquirencia.TipoProcessamento;
+import org.springframework.beans.factory.InitializingBean;
+import com.sysdata.util.Util
+import org.grails.plugins.settings.*
+import com.sysdata.arquivo.*
+import com.sysdata.coadquirencia.*
+import com.sysdata.elavon.*
+
+class ArquivoElavonVendaSerialService extends ArquivoElavonVendaService{
+
+	def processar() {
+		log.debug "Iniciando processamento de arquivo movimento venda crédito elavon..."
+		log.debug "Copiando arquivos baixados da Redecard..."
+		def larqs=copyFromElavonDir()
+		def dirBackup=Setting.valueFor("processamento.arquivo.dir.backup","${Util.baseDir}/processamento/arquivo/backup")
+		if (larqs) log.debug "Processando ${larqs.size()} arquivo(s) ..."
+		else log.debug "Nenhum arquivo para ser processado"
+		larqs=larqs.sort {fn-> fn[-6..-5]+fn[-8..-7]+fn[-10..-9]}
+		larqs.each { fn->
+			log.debug "Importando arquivo ${fn}..."
+			def r=processar(fn) 
+			gormCleanUp()
+			log.debug "Processado ${fn} => ${r}"
+			def fnome=Util.extractFileName(fn)
+			def fnback=Util.uniqueFileName(Util.addSlash(dirBackup)+fnome)
+			log.debug "Backup: ${fn} => ${fnback}"
+			Util.moveFile(fn,fnback)
+		}
+		log.debug "Fim do processamento de arquivo Elavon"
+	}
+	// Interfaces para sistema de processamento de arquivo (ArquivoConfig)
+	def processar(String filename) {
+		log.info "processando ${filename}..."
+		def f=new File(filename)
+		if (f.exists()) {
+			processar(f)
+		} else{
+			throw new RuntimeException("Arquivo ${filename} não encontrado")
+		}
+	}
+		
+	def processar(File f) {
+		def arquivo
+		if (f.exists() && f.size()>0) {
+			def oks=0
+			def fails=0
+			def errors=[]
+			def ignored=0
+			int i=1
+			def ignore=false
+			def nl=0
+			def ctxInicial=[file:f]
+			f.toCsvReader(['separatorChar':'|']).eachLine{ tokens ->
+				
+				if (!ignore) {
+					def ctx=[:]
+					ctx+=ctxInicial
+					def l
+					try {
+						l=process(vendaMap,tokens,ctx)
+					} catch(Exception e) {
+						log.debug "Exception: ${e.message}"
+						log.debug " File  : $f.name"
+						log.debug " Line  : $i"
+						log.debug " Tokens: $tokens"
+						throw e
+					}
+					log.debug "Result: ${l}"
+					if (l.reg=='02' && l._ignore) {
+						ignore=true
+						ignored++
+					} else if (l._ignore) {
+						ignored++
+					} else {
+						nl++
+						if (l.reg=='02' && l.arquivo)
+							ctxInicial['arquivo']=l.arquivo
+						if (l.reg==LOTE_VENDA && l.loteVenda)
+							ctxInicial.loteVenda=l.loteVenda
+						if (l.reg==TRANSACAO && l.transacao)
+							ctxInicial.transacao=l.transacao
+						if (nl>MIN_CLEAN) {
+							def lvid=l.loteVenda?.id
+							def arid=l.arquivo?.id
+							def trid=l.transacao?.id
+							log.debug "Cleaning Hibernate Session..."
+							gormCleanUp()
+							nl=0
+							if (lvid) {
+								l.loteVenda=LoteVendaElavon.get(lvid)
+								log.debug "CTX <= ${l.loteVenda}"
+							}
+							if (arid) {
+								l.arquivo=ArquivoElavon.get(arid)
+								log.debug "CTX <= ${l.arquivo}"
+							}
+							if (trid) {
+								l.transacao=TransacaoElavon.get(trid)
+								log.debug "CTX <= ${l.transacao}"
+							}
+						}
+
+						if (l._status=='OK') oks++
+						else {
+							fails++
+							def line=tokens.join('|')
+							errors.add([linha:i,error:l._error, line:line ])
+						}
+						if (l.arquivo) arquivo=l.arquivo
+					}
+				} else {
+					ignored++
+				}
+				i++
+			}
+			log.info "Resultado Processamento: [OKS: ${oks}|Fails: ${fails}|Errors: ${errors}|ignored:${ignored}]"
+			def r=[oks:oks,fails:fails,linhas:i,tamanho:f.size()]
+			if (arquivo) 
+				r.arquivo=arquivo
+			if (errors) {
+				r.status=StatusArquivo.PROCESSADO_ERRO
+				r.errors=errors
+			} else r.status=StatusArquivo.PROCESSADO_OK
+			if (ignore)
+				r.ignored=true
+			r
+		} else {
+			log.debug "Arquivo ${f} nao encontrado ou vazio"
+			[status:StatusArquivo.ERRO,error:"Arquivo ${f} nao encontrado ou vazio",tamanho:f.size()]
+		}
+	}
+	def desprocessar(ArquivoElavon a) {
+		def toDelete=TransacaoElavon.createCriteria().list {
+			eq('arquivo',a)
+		}.collect { it }
+		log.debug "Deletando ${toDelete.size()} transacoes..."
+		toDelete.each{
+			it.lote = null
+			it.save(flush:true)
+		}
+		toDelete.each { it.delete() }
+		
+		toDelete=DadosAdicionaisElavon.createCriteria().list {
+			eq('arquivo',a)
+		}.collect { it }
+		log.debug "Deletando ${toDelete.size()} dados adicionais..."
+		toDelete.each { it.delete(flush:true) }
+
+		toDelete=IcptElavon.createCriteria().list {
+			eq('arquivo',a)
+		}.collect { it }
+		log.debug "Deletando ${toDelete.size()} dados adicionais..."
+		toDelete.each { it.delete(flush:true) }
+
+		toDelete=LoteVendaElavon.createCriteria().list {
+			eq('arquivo',a)
+		}.collect { it }
+		log.debug "Deletando ${toDelete.size()} dados adicionais..."
+		toDelete.each { it.delete(flush:true) }
+
+		log.debug "Deletando arquivo #$a.id [$a.nome]"
+		a.delete(flush:true)
+	}
+	
+	// Metodos para manter compatibilidade com versoes anteriores
+	def importarArquivo(String f) {
+		processar(f)
+	}
+	def importar(f) {
+		processar(f)
+	}
+	// Metodos privados =================================================================
+	
+	private def copyFromElavonDir() {
+		def larquivos=[]
+		def dirElavon=Setting.valueFor("processamento.arquivo.dir.entrada.elavon","${Util.homeDir}/elavon/arquivos")
+		def dirEntrada=Setting.valueFor('processamento.arquivo.dir.entrada',"${Util.baseDir}/processamento/arquivo/entrada")+'/elavon'
+		log.debug "${dirElavon} => ${dirEntrada}"
+		def delavon=new File(dirElavon)
+		if (delavon.isDirectory()) {
+			def lfiles=[]
+			def match=Setting.valueFor("processamento.arquivo.elavon.venda.credito.match","Elavon_Accesstage_T_\\d{4}_\\d{6}.txt")
+			log.debug "Pattern: $match"
+			delavon.eachFileMatch(~match) {
+				def fn=it.name
+				if (!ArquivoElavon.findByNome(fn)) {
+					log.debug "Adding ${it} to be processed..."
+					lfiles.add(it)
+				} else log.debug "Skip ${it}..."
+			}
+			lfiles.each { fsource->
+				def destFileName="${dirEntrada}/${fsource.name}"
+				def fdest=new File(destFileName)
+				log.debug "Copiando ${fsource}..."
+				Util.copyFile(fsource,fdest)
+				larquivos.add(destFileName)
+			}
+			
+		} else {
+			throw RuntimeException("${dirElavon} não é um diretorio")
+		}
+		larquivos
+	}
+}
+
+
+
+package com.sysdata.elavon
+
+import java.util.Date;
+
+import com.sysdata.coadquirencia.TipoProcessamento;
+import org.springframework.beans.factory.InitializingBean;
+import com.sysdata.util.Util
+import org.grails.plugins.settings.*
+import com.sysdata.arquivo.*
+import com.sysdata.coadquirencia.*
+
+class ArquivoElavonVendaService implements InitializingBean{
+	def processamentoService
+	def grailsApplication
+	
+	def force=false
+	
+	def fdata=new java.text.SimpleDateFormat('ddMMyyyy')
+	def fhora=new java.text.SimpleDateFormat('HHmmss')
+	def fdataHora=new java.text.SimpleDateFormat('ddMMyyyyHHmmss')
+	
+	def propsArquivoElavon
+	def sessionFactory
+	def propertyInstanceMap = org.codehaus.groovy.grails.plugins.DomainClassGrailsPlugin.PROPERTY_INSTANCE_MAP
+	
+	def gormCleanUp() {
+		def session = sessionFactory.currentSession
+		session.flush()
+		session.clear()
+		propertyInstanceMap.get().clear()
+	}
+	//==================================================================================================
+	
+	static int	MIN_CLEAN			= 500
+	static String HEADER				= '02'
+	static String LOTE_VENDA			= '06'
+	static String TRANSACAO			= '11'
+	static String ICPT				= '12'
+	static String DADOS_ADICIONAIS	= '15'
+	static String LOTE_PARC_FUTURO 	= '20'
+	static String TRAILLER			= '98'
+	
+	//==================================================================================================
+	
+	public void afterPropertiesSet() throws Exception {
+		def dca = grailsApplication.getDomainClass(ArquivoElavon.class.name)
+		propsArquivoElavon=dca.properties.name
+
+	}
+	
+	//==================================================================================================
+	def parseDataHora = {d,h->
+		def dh=d+h
+		if (dh.size()==14) return fdataHora.parse(dh)
+		if (dh.size()==8) return fdata.parse(dh)
+		else throw RuntimeException("Data/Hora [$dh] com tamanho inválido: ${dh.size()}")
+	}
+	def parseData = {f->
+		if(f) fdata.parse(f)
+	}
+	
+	def parseTipoTransacao = {f->
+		TipoTransacaoElavon.valueOf(f)
+	}
+	
+	def parseProduto = {f->
+		ProdutoElavon.get(f)
+	}
+	def parseTipoCartao = {f->
+		f
+	}
+	def parseModoCaptura = {f->
+		ModoCapturaElavon.findByCodigo(f)
+	}
+	def parseTipoProcessamento= { f->
+		TipoProcessamentoElavon.valueOf(f)
+	}
+	def parseValor(String s,String v,Integer d=2) {
+		if (v) {
+			def val=v.toLong()/(10D ** d) //estava assim v.toInteger() 
+			if (s=='-') val=-val
+			val
+		} else 0D
+	}
+
+	def parseValorTotal(ctx) {
+		def totParc=ctx[14].trim()
+		def vlTot=ctx[16].trim() 
+		def vlTrn=(totParc=="" && vlTot=="")?parseValor(ctx[17],ctx[18]):parseValor(ctx[15],ctx[16])
+		vlTrn
+	}
+
+	// Trata Registros
+	
+	def trataHeader = {ctx->
+		log.debug "HEADER: $ctx"
+		if (!ctx.arquivo) {
+			def fn=ctx.file?.name
+			def arquivoJaProcessado
+			if (fn) {
+				arquivoJaProcessado=ArquivoElavon.createCriteria().list {
+					eq('nome',fn)
+					eq('tipo',TipoArquivo.ARQUIVO_VENDA_ELAVON)
+				}
+			}
+			if (arquivoJaProcessado && !force) {
+				arquivoJaProcessado=arquivoJaProcessado[0]
+				log.debug "Arquivo $fn já processado em ${arquivoJaProcessado.dateCreated}"
+				ctx._ignore=true
+			} else {
+				if(arquivoJaProcessado && force) {
+					log.debug "Arquivo lote $fn já processado em ${arquivoJaProcessado.dateCreated} - FORCADO REPROCESSAMENTO"
+				}
+				def pars=ctx.findAll { it.key in propsArquivoElavon }
+				def arquivo=new ArquivoElavon()
+				pars.each {k,v->
+					arquivo[k]=v
+				}
+				if (ctx.destinatario) {
+					def cadeia=ctx.destinatario.substring(5).toInteger()
+					arquivo.cadeia=cadeia
+				}
+				arquivo.tipo=TipoArquivo.ARQUIVO_VENDA_ELAVON
+				if (fn) arquivo.nome=fn
+				
+				log.debug "Data Arquivo: ${arquivo.dataArquivo}"
+				
+				
+				arquivo.save(flush:true, failOnError:true)
+				ctx.arquivo=arquivo
+				log.debug "Arquivo $fn criado"
+				ctx._status='OK'
+			}
+		} else {
+			def msg="Header ja processado anteriormente. Já existe arquivo no contexto"
+			log.debug msg
+			throw new RuntimeException(msg)
+		}
+		ctx
+	}
+	def trataLoteVendas = {ctx->
+		log.debug "VENDAS: $ctx"
+		def lv=findLoteVenda(ctx)
+		if (lv && ctx.arquivo?.tipoProcessamento==TipoProcessamentoElavon.SUBMISSAO) {
+			log.debug "Lote de Venda ja processada SKIP  : $lv [$ctx]"
+			ctx._status='OK'
+			ctx._ignore=true
+			return ctx
+		} else if (lv && ctx.arquivo?.tipoProcessamento==TipoProcessamentoElavon.REPROCESSAMENTO) {
+			log.debug "Lote Venda ja processada UPDATE: $lv [$ctx]"
+			lv.properties=ctx
+		} else if (!lv) { 
+			lv=new LoteVendaElavon(ctx)
+			lv.arquivo=ctx.arquivo
+			lv.cenario=Cenario.III
+			lv.save(flush:true, failOnError:true)
+		}
+		ctx.loteVenda=lv
+		ctx._status='OK'
+		ctx
+	}
+	def trataTransacao = { ctx->
+		log.debug "TRANSC: $ctx"
+		def tr=findTransacao(ctx)
+		if (tr && ctx.arquivo?.tipoProcessamento==TipoProcessamentoElavon.SUBMISSAO) {
+			log.debug "Transacao ja processada SKIP  : $tr [$ctx]"
+			ctx._status='OK'
+			ctx._ignore=true
+			return ctx
+		} else if (tr && ctx.arquivo?.tipoProcessamento==TipoProcessamentoElavon.REPROCESSAMENTO) {
+			log.debug "Transacao ja processada UPDATE: $tr [$ctx]"
+			tr.properties=ctx
+		} else if (!tr) {
+			tr=new TransacaoElavon(ctx)
+			tr.statusConciliacao=StatusConciliacao.PENDENTE
+		}
+		if (ctx.arquivo) {
+			tr.arquivo=ctx.arquivo
+		}
+		if (ctx.loteVenda) {
+			def lote=ctx.loteVenda
+			tr.lote=lote
+			tr.tipoTransacao=lote.tipoTransacao
+			tr.produto=lote.produto
+			tr.cenario=lote.cenario
+		}
+		tr.save(flush:true, failOnError:true)
+		ctx._status='OK'
+		ctx.transacao=tr
+		ctx
+
+	}
+	
+	def trataIcpt = {ctx->
+		log.debug "ICPT  : $ctx"
+		// o nsu estar vindo null quando a transação é um ajuste
+		if(ctx.nsu == null) {
+			log.debug "NSUnull: ${ctx.nsu}"
+			ctx.nsu = 0.toLong()
+		}
+		
+		def icpt=findIcpt(ctx)
+		if (icpt && ctx.arquivo?.tipoProcessamento==TipoProcessamentoElavon.SUBMISSAO) {
+			log.debug "ICPT ja processada SKIP  : $icpt [$ctx]"
+			ctx._status='OK'
+			ctx._ignore=true
+			return ctx
+		} else if (icpt && ctx.arquivo?.tipoProcessamento==TipoProcessamentoElavon.REPROCESSAMENTO) {
+			log.debug "ICPT ja processada UPDATE: $icpt [$ctx]"
+			icpt.properties=ctx
+			icpt.save(flush:true, failOnError:true)
+		} else if (!icpt) {
+			icpt=new IcptElavon(ctx)
+			icpt.arquivo=ctx.arquivo
+			if (ctx.loteVenda) {
+				icpt.lote=ctx.loteVenda
+				ctx.loteVenda.cenario=Cenario.II
+			}
+			if (ctx.transacao) {
+				ctx.transacao.cenario=Cenario.II
+			}
+			if (ctx.transacao && ctx.transacao.itrn==ctx.itrn && ctx.transacao.nsu==ctx.nsu) {
+				icpt.transacao= ctx.transacao
+			}
+			icpt.save(flush:true, failOnError:true)
+		}
+		ctx._status='OK'
+		ctx
+	}
+	def trataParceladoFuturo = {ctx->
+		log.debug "PRC.FT: $ctx"
+		
+		def lpv=findLoteParceladoFuturo(ctx)
+		if (lpv && ctx.arquivo?.tipoProcessamento==TipoProcessamentoElavon.SUBMISSAO) {
+			log.debug "Lote de Venda (parcelado futuro) ja processada SKIP  : $lpv [$ctx]"
+			ctx._status='OK'
+			ctx._ignore=true
+			return ctx
+		} else if (lpv && ctx.arquivo?.tipoProcessamento==TipoProcessamentoElavon.REPROCESSAMENTO) {
+			log.debug "Lote Venda (parcelado futuro) ja processada UPDATE: $lpv [$ctx]"
+			lpv.properties=ctx
+			lpv.loteVenda=ctx.loteVenda
+			lpv.cenario=ctx.loteVenda.cenario
+			lpv.save(flush:true, failOnError:true)
+		} else if (!lpv) {
+			lpv=new LoteParceladoFuturoElavon(ctx)
+			lpv.loteVenda=ctx.loteVenda
+			lpv.cenario=ctx.loteVenda.cenario
+			lpv.arquivo=ctx.arquivo
+			lpv.save(flush:true, failOnError:true)
+		}
+		ctx._status='OK'
+		ctx
+	}
+	def trataDadosAdicionais = {ctx->
+		log.debug "D.ADIC: $ctx"
+		def da=findDadosAdicionais(ctx)	
+		if (da && ctx.arquivo?.tipoProcessamento==TipoProcessamentoElavon.SUBMISSAO) {
+			log.debug "Lote de Venda (parcelado futuro) ja processada SKIP  : $da [$ctx]"
+			ctx._status='OK'
+			ctx._ignore=true
+			return ctx
+		} else if (da && ctx.arquivo?.tipoProcessamento==TipoProcessamentoElavon.REPROCESSAMENTO) {
+			log.debug "Lote Venda (parcelado futuro) ja processada UPDATE: $da [$ctx]"
+			da.properties=ctx
+		} else if (!da) {
+			new DadosAdicionaisElavon(ctx)
+			da.arquivo=ctx.arquivo
+			if (ctx.loteVenda)
+				da.lote=ctx.loteVenda
+			if (ctx.transacao & ctx.transacao.itrn==ctx.itrn && ctx.transacao.nsu==ctx.nsu)
+				da.transacao=ctx.transacao
+			da.save(flush:true, failOnError:true)
+		}
+		ctx._status='OK'
+		ctx
+	}
+	
+	def vendaMap = [
+		index:0,
+		mapping:[
+		'02': [
+			descricao:'Header',
+			handler:trataHeader,
+			fields:[
+			0:[field:'tipoRegistro','import':false,type:'STRING',check:true,default:'02'],
+			1:[field:'destinatario','import':true,check:true,type:'STRING'],
+			2:[field:'grupoClientes',ignore:true],
+			3:[field:'moeda','import':false,check:true,type:'STRING',default:'BRL'],
+			4:[field:'adquirente','import':false,check:true,type:'STRING',default:'ELAVON'],
+			5:[field:'extrato','import':false,check:true,type:'STRING',default:'EXTRATO ELETRONICO DE VENDAS'],
+			6:[field:'data',ignore:true],
+			7:[field:'dataArquivo','import':true,parse:{f,c-> parseDataHora(c[6],f)}],
+			8:[field:'periodoInicial','import':true, parse:parseData],
+			9:[field:'periodoFinal','import':true, parse:parseData],
+			10:[field:'tipoProcessamento','import':true],
+			11:[field:'dataProcessamento','import':true, parse:parseData],
+			12:[field:'versao','import':true],
+			13:[filed:'van','import':false]
+			
+			]
+		],
+		'06': [
+			descricao:'Lotes de Venda',
+			handler:trataLoteVendas,
+			fields:[
+			0:[field:'tipoRegistro','import':false,type:'STRING',check:true,default:'06'],
+			1:[field:'cnpj','import':true],
+			2:[field:'estabelecimento','import':true],
+			3:[field:'terminal','import':true],
+			4:[field:'loteAutorizador','import':true,parse:{f-> f ? f.toLong() : null }],
+			5:[field:'loteFinanceiro','import':true,parse:{f-> f ? f.toLong() : null }],
+			6:[field:'dataProcessamento','import':true,parse:parseData],
+			7:[field:'dataPagamentoPrevista','import':true,parse:parseData],
+			8:[field:'tipoTransacao','import':true,parse:parseTipoTransacao],
+			9:[field:'produto','import':true,parse:parseProduto],
+		   10:[field:'parcela','import':true,parse:{f-> f ? f.toInteger() : 1}],
+		   11:[field:'totalParcelas','import':true,parse:{f-> f ? f.toInteger() : 1}],
+		   12:[field:'sinal',ignore:true],
+		   13:[field:'valorBruto','import':true,parse:{f,c-> parseValor(c[12],f)}],
+		   14:[field:'sinal',ignore:true],
+		   15:[field:'valorTaxaDesconto','import':true,parse:{f,c-> parseValor(c[14],f,2)}],
+		   16:[field:'sinal',ignore:true],
+		   17:[field:'valorLiquido','import':true,parse:{f,c-> parseValor(c[16],f,2)}],
+		   18:[field:'noItems','import':false,parse:{f-> f ? f.toInteger() : 0}],
+		   19:[field:'descricao','import':true]
+		   ]
+		],
+		'11': [
+			descricao:'Transacao',
+			handler:trataTransacao,
+			fields:[
+			0:[field:'tipoRegistro','import':false,type:'STRING',check:true,default:'11'],
+			1:[field:'estabelecimento','import':true],
+			2:[field:'terminal','import':true],
+			3:[field:'data','import':true,parse:parseData],
+			4:[field:'dataTransacao','import':true,parse:{f,c -> parseDataHora(c[3],f)}],
+			5:[field:'loteAutorizador','import':true,parse:{f-> f ? f.toLong() : null }],
+			6:[field:'loteFinanceiro','import':true,parse:{f-> f ? f.toLong() : null }],
+			7:[field:'cartao','import':true,parse:{f->Util.padronizaCartao(f)}],
+			8:[field:'codigoAutorizacao','import':true],
+			9:[field:'nsu','import':true,parse:{f-> f ? f.toLong() : null }],
+		   10:[field:'itrn','import':true,parse:{f-> f ? f.toLong() : null }],
+		   11:[field:'modoCaptura','import':true,parse:parseModoCaptura],
+		   12:[field:'descricao','import':true],
+		   13:[field:'parcela','import':true,parse:{f-> f ? f.toInteger() : 1}],
+		   14:[field:'totalParcelas','import':true,parse:{f-> f ? f.toInteger() : 1}],
+		   15:[field:'sinal',ignore:true],
+		   16:[field:'valorTotal','import':true,parse:{f,c-> parseValorTotal(c)}],
+		   17:[field:'sinal',ignore:true],
+		   18:[field:'valorParcela','import':true,parse:{f,c-> parseValor(c[17],f)}],
+		   19:[field:'sinal',ignore:true],
+		   20:[field:'valorTaxaDesconto','import':true,parse:{f,c-> parseValor(c[19],f,6)}],
+		   21:[field:'sinal',ignore:true],
+		   22:[field:'valorLiquido','import':true,parse:{f,c-> parseValor(c[21],f,6)}],
+		   23:[field:'taxaDesconto','import':true,parse:{f,c-> parseValor('',f,6)}],
+		   24:[field:'tarifa','import':true,parse:{f,c-> parseValor('',f,6)}]
+			]
+		],
+		'12': [
+			descricao:'ICPT',
+			handler:trataIcpt,
+			fields:[
+			0:[field:'tipoRegistro','import':false,type:'STRING',check:true,default:'12'],
+			1:[field:'estabelecimento','import':true],
+			2:[field:'itrn','import':true,parse:{f-> f ? f.toLong() : null }],
+			3:[field:'nsu','import':true,parse:{f-> f ? f.toLong() : null }],
+			4:[field:'tipoCartao','import':true,parse:parseTipoCartao],
+			5:[field:'codigoDescricao','import':true,parse:{f-> f ? f.toInteger() : 0}],
+			6:[field:'sinal',ignore:true],
+			7:[field:'valorIntercambio','import':true,parse:{f,c-> parseValor(c[6],f,6)}],
+			8:[field:'sinal',ignore:true],
+			9:[field:'valorTaxaBandeira','import':true,parse:{f,c-> parseValor(c[8],f,6)}],
+		   10:[field:'sinal',ignore:true],
+		   11:[field:'valorMargem','import':true,parse:{f,c-> parseValor(c[10],f,6)}],
+			]
+		],
+		'15': [
+			descricao:'Dados Adicionais',
+			handler:trataDadosAdicionais,
+			fields: [
+			0:[field:'tipoRegistro','import':false,type:'STRING',check:true,default:'12'],
+			1:[field:'estabelecimento','import':true],
+			2:[field:'itrn','import':true,parse:{f-> f ? f.toLong() : null }],
+			3:[field:'nsu','import':true,parse:{f-> f ? f.toLong() : null }],
+			4:[field:'descricao','import':true],
+			5:[field:'transactionId','import':true]
+			]
+		],
+		'20':[
+			descricao:'Parcelado Futuro',
+			handler:trataParceladoFuturo,
+			fields: [
+			0:[field:'tipoRegistro','import':false,type:'STRING',check:true,default:'20'],
+			1:[field:'cnpj','import':true],
+			2:[field:'estabelecimento','import':true],
+			3:[field:'terminal','import':true],
+			4:[field:'loteAutorizador','import':true,parse:{f-> f ? f.toLong() : null }],
+			5:[field:'loteFinanceiro','import':true,parse:{f-> f ? f.toLong() : null }],
+			6:[field:'dataProcessamento','import':true,parse:parseData],
+			7:[field:'dataPagamentoPrevista','import':true,parse:parseData],
+			8:[field:'tipoTransacao','import':true,parse:parseTipoTransacao],
+			9:[field:'produto','import':true,parse:parseProduto],
+		   10:[field:'parcela','import':true,parse:{f-> f ? f.toInteger() : 1}],
+		   11:[field:'totalParcelas','import':true,parse:{f-> f ? f.toInteger() : 1}],
+		   12:[field:'sinal',ignore:true],
+		   13:[field:'valorBruto','import':true,parse:{f,c-> parseValor(c[12],f)}],
+		   14:[field:'sinal',ignore:true],
+		   15:[field:'valorTaxaDesconto','import':true,parse:{f,c-> parseValor(c[14],f,2)}],
+		   16:[field:'sinal',ignore:true],
+		   17:[field:'valorLiquido','import':true,parse:{f,c-> parseValor(c[16],f,2)}],
+		   18:[field:'noItems','import':false,parse:{f-> f ? f.toInteger() : 0}],
+		   19:[field:'descricao','import':true]
+		   ]
+		],
+		'98':[
+			descricao:'Trailer',
+			fields:[]
+		]
+		]
+	]
+	
+	
+	def process(map,tokens,ctx) {
+		def result=[:]
+		def idx=map.index
+		def id=tokens[idx]
+		result.reg=id
+		result+=ctx
+		def m=map.mapping[id]
+		if (m) {
+			def mf=m.fields
+			mf.each {i,cfg->
+				if(!cfg.ignore) {
+					def fld=cfg.field
+					def val=tokens[i]
+					if (cfg.parse) {
+						def c=cfg.parse
+						if (c.maximumNumberOfParameters == 1)
+							val=c(val)
+						else
+							val=c(val, tokens)
+					}
+					if (cfg.check && cfg.default) {
+						if(cfg.default!=val) throw new RuntimeException("Erro ao validar dados")
+					}
+					if (cfg['import']|| cfg['import']==null) {
+						result[fld]=val
+					}
+				}
+			}
+			if (m.handler && m.handler instanceof Closure) {
+				m.handler(result)
+			}
+		}
+		result
+	}
+	
+	// Metodos privados =================================================================
+	
+	private def findTransacao(ctx) {
+		def lt=TransacaoElavon.createCriteria().list {
+			eq('estabelecimento',ctx.estabelecimento)
+			eq('codigoAutorizacao',ctx.codigoAutorizacao)
+			eq('valorTotal',ctx.valorTotal?.toDouble())
+			eq('dataTransacao',ctx.dataTransacao)
+			eq('cartao',ctx.cartao)
+			eq('tipoTransacao',ctx.tipoTransacao)
+		}
+		lt ? lt[0] : null
+	}
+	private def findIcpt(ctx) {
+		def lt=IcptElavon.createCriteria().list {
+			eq('nsu',ctx.nsu)
+			eq('itrn',ctx.itrn)
+		}
+		lt ? lt[0] : null
+	}
+	private def findDadosAdicionais(ctx) {
+		def lt=DadosAdicionaisElavon.createCriteria().list {
+			eq('nsu',ctx.nsu)
+			eq('itrn',ctx.itrn)
+		}
+		lt ? lt[0] : null
+	}
+	private def findLoteVenda(ctx) {
+		def ll=LoteVendaElavon.createCriteria().list {
+			eq('terminal',ctx.terminal)
+			eq('loteAutorizador',ctx.loteAutorizador)
+			eq('loteFinanceiro',ctx.loteFinanceiro)
+			eq('tipoTransacao',ctx.tipoTransacao)
+			eq('produto',ctx.produto)
+		}
+		ll ? ll[0] : null
+	}
+	private def findLoteParceladoFuturo(ctx) {
+		def ll=LoteParceladoFuturoElavon.createCriteria().list {
+			eq('terminal',ctx.terminal)
+			eq('loteAutorizador',ctx.loteAutorizador)
+			eq('tipoTransacao',ctx.tipoTransacao)
+			eq('produto',ctx.produto)
+			eq('parcela',ctx.parcela)
+		}
+		ll ? ll[0] : null
+	}
+}
+
